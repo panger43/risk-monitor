@@ -1,4 +1,4 @@
-"""Streamlit Risk Dashboard — company-first navigation, then headlines."""
+"""Streamlit Risk Dashboard — company-first navigation with company search filter."""
 
 from __future__ import annotations
 
@@ -230,16 +230,37 @@ def render_company_home(
     min_severity: int,
 ) -> None:
     st.subheader("Companies")
+    
+    # --- SEARCH / FILTER BAR ---
+    search_query = st.text_input(
+        "Search companies",
+        placeholder="Search by company name or ticker (e.g., Tencent, HSBC, 0700.HK)...",
+        label_visibility="collapsed",
+    )
+
     render_watchlist_editor(client, active_watch, watched_df)
 
     if active_watch.empty:
         st.info("No active companies. Open **Manage watchlist** above to add one.")
         return
 
+    # Filter active companies by search query if provided
+    filtered_watch = active_watch.copy()
+    if search_query.strip():
+        q = search_query.strip().lower()
+        filtered_watch = filtered_watch[
+            filtered_watch["company_name"].astype(str).str.lower().str.contains(q)
+            | filtered_watch["ticker"].astype(str).str.lower().str.contains(q)
+        ]
+
+    if filtered_watch.empty:
+        st.warning(f"No companies found matching '{search_query}'.")
+        return
+
     scoped = events_df[events_df["severity_score"] >= min_severity] if not events_df.empty else events_df
 
     company_rows: list[dict[str, object]] = []
-    for row in active_watch.itertuples():
+    for row in filtered_watch.itertuples():
         ticker = str(row.ticker)
         company_events = scoped[scoped["ticker"] == ticker] if not scoped.empty else pd.DataFrame()
         max_sev = int(company_events["severity_score"].max()) if not company_events.empty else 0

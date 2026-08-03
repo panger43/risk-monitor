@@ -1,0 +1,8 @@
+---
+description: Project tech stack and defensive coding boundaries
+alwaysApply: true
+---
+# Project Guidelines
+- Python 3.12+, Supabase, OpenAI Structured Outputs, Trafilatura
+- Use strict type hints and Pydantic schemas for LLM parsing
+- Zero-placeholder policy: write complete code, never leave '// TODO' or incomplete blocks

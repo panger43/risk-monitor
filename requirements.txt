@@ -1,0 +1,7 @@
+supabase
+openai
+feedparser
+trafilatura
+pydantic
+requests
+python-dotenv

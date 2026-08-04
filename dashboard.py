@@ -155,10 +155,14 @@ def trigger_scan(*, tickers: list[str] | None = None) -> None:
         st.error(f"Scan failed: {exc}")
         return
 
-    progress.progress(1.0, text="Scan complete")
-    st.success(
+    # Stay on the company page after a single-ticker scan.
+    if tickers and len(tickers) == 1:
+        st.session_state.selected_ticker = tickers[0].upper()
+    st.session_state.app_view = "home"
+    st.session_state["last_scan_summary"] = (
         f"Scan done ({result['scope']}): "
-        f"{result['processed']} processed, {result['skipped']} skipped, {result['errors']} errors"
+        f"{result['processed']} processed, {result['skipped']} skipped, "
+        f"{result['errors']} errors, {result['queued']} queued"
     )
     st.rerun()
 
@@ -259,19 +263,11 @@ def processed_field(row: pd.Series, field: str) -> str | None:
     return None
 
 
-def load_events(client: Client, timeframe_days: int) -> pd.DataFrame:
-    response = (
-        client.table("risk_events")
-        .select("*, processed_sources(url, title, source_type)")
-        .order("created_at", desc=True)
-        .limit(500)
-        .execute()
-    )
-    data = response.data or []
-    if not data:
-        return pd.DataFrame()
+def _normalize_events_df(df: pd.DataFrame, timeframe_days: int) -> pd.DataFrame:
+    if df.empty:
+        return df
 
-    df = pd.DataFrame(data)
+    df = df.copy()
     df["url"] = df.apply(
         lambda row: row["url"]
         if isinstance(row.get("url"), str) and str(row.get("url")).startswith("http")
@@ -282,15 +278,56 @@ def load_events(client: Client, timeframe_days: int) -> pd.DataFrame:
         lambda row: processed_field(row, "title") or row.get("key_impact") or "Untitled event",
         axis=1,
     )
-    df["source_type"] = df.apply(lambda row: processed_field(row, "source_type") or "unknown", axis=1)
+    df["source_type"] = df.apply(
+        lambda row: processed_field(row, "source_type") or "unknown",
+        axis=1,
+    )
     df["source_label"] = df["source_type"].map(
-        lambda s: SOURCE_LABELS.get(s, s.replace("_", " ").title())
+        lambda s: SOURCE_LABELS.get(s, str(s).replace("_", " ").title())
     )
     published = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
     created = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
     df["event_at"] = published.fillna(created)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=timeframe_days)
-    return df[df["event_at"] >= pd.Timestamp(cutoff)].copy()
+    df["ticker"] = df["ticker"].astype(str).str.upper()
+    cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(days=timeframe_days))
+    recently_published = df["event_at"] >= cutoff
+    recently_ingested = created >= cutoff
+    return df[recently_published | recently_ingested].copy()
+
+
+def _fetch_risk_event_rows(client: Client, *, ticker: str | None = None, limit: int = 500) -> list[dict]:
+    """Fetch risk_events; fall back if processed_sources embed isn't available."""
+    query = client.table("risk_events").select("*, processed_sources(url, title, source_type)")
+    if ticker:
+        query = query.eq("ticker", ticker.upper())
+    query = query.order("created_at", desc=True).limit(limit)
+    try:
+        return query.execute().data or []
+    except Exception:
+        query = client.table("risk_events").select("*")
+        if ticker:
+            query = query.eq("ticker", ticker.upper())
+        return query.order("created_at", desc=True).limit(limit).execute().data or []
+
+
+def load_events(client: Client, timeframe_days: int) -> pd.DataFrame:
+    data = _fetch_risk_event_rows(client, limit=1000)
+    if not data:
+        return pd.DataFrame()
+    return _normalize_events_df(pd.DataFrame(data), timeframe_days)
+
+
+def load_events_for_ticker(client: Client, ticker: str, timeframe_days: int) -> pd.DataFrame:
+    """Load headlines for one ticker directly (avoids global 500-row blind spot)."""
+    data = _fetch_risk_event_rows(client, ticker=ticker, limit=300)
+    if not data:
+        # Some rows may have been stored with different casing before normalization.
+        data = _fetch_risk_event_rows(client, limit=1000)
+        if not data:
+            return pd.DataFrame()
+        df = _normalize_events_df(pd.DataFrame(data), timeframe_days)
+        return df[df["ticker"] == ticker.upper()].copy()
+    return _normalize_events_df(pd.DataFrame(data), timeframe_days)
 
 
 def render_headline_card(row: pd.Series) -> None:
@@ -462,16 +499,21 @@ def render_company_home(
                     st.rerun()
 
 def render_company_detail(
+    client: Client,
     ticker: str,
     active_watch: pd.DataFrame,
-    events_df: pd.DataFrame,
     *,
+    timeframe_days: int,
     min_severity: int,
     selected_source: str,
     selected_timeframe: str,
 ) -> None:
-    name_series = active_watch.loc[active_watch["ticker"] == ticker, "company_name"]
+    name_series = active_watch.loc[
+        active_watch["ticker"].astype(str).str.upper() == str(ticker).upper(),
+        "company_name",
+    ]
     company_name = str(name_series.iloc[0]) if not name_series.empty else ticker
+    ticker_key = str(ticker).upper()
 
     nav_l, nav_r = st.columns([1, 1])
     with nav_l:
@@ -480,12 +522,17 @@ def render_company_detail(
             st.rerun()
     with nav_r:
         if st.button("Scan this company", use_container_width=True, type="primary"):
-            trigger_scan(tickers=[ticker])
+            trigger_scan(tickers=[ticker_key])
 
     st.subheader(f"{company_name}")
-    st.caption(f"`{ticker}` · {selected_timeframe}")
+    st.caption(f"`{ticker_key}` · {selected_timeframe}")
 
-    company_events = events_df[events_df["ticker"] == ticker].copy() if not events_df.empty else pd.DataFrame()
+    scan_summary = st.session_state.pop("last_scan_summary", None)
+    if scan_summary:
+        st.success(scan_summary)
+
+    # Always fetch this ticker fresh from Supabase (not from the global home feed).
+    company_events = load_events_for_ticker(client, ticker_key, timeframe_days)
     if not company_events.empty:
         company_events = company_events[company_events["severity_score"] >= min_severity]
         if selected_source != "ALL":
@@ -502,7 +549,15 @@ def render_company_detail(
     m3.metric("Mild (<6)", int((company_events["severity_score"] < 6).sum()) if not company_events.empty else 0)
 
     if company_events.empty:
-        st.info("No headlines here yet. Use **Scan this company** to pull fresh coverage.")
+        # Help distinguish "nothing in DB" vs "filtered out".
+        raw = _fetch_risk_event_rows(client, ticker=ticker_key, limit=5)
+        if raw:
+            st.warning(
+                f"Found {len(raw)}+ rows in the database for `{ticker_key}`, but none match "
+                f"the current time/severity/source filters. Try **Last 3 months** or lower min severity."
+            )
+        else:
+            st.info("No headlines in the database for this ticker yet. Run **Scan this company**.")
         return
 
     for _, row in company_events.iterrows():
@@ -534,6 +589,11 @@ if st.session_state.app_view == "admin":
 
 st.title("Primas Asset Management Risk Radar")
 st.caption("Approve new companies via **Admin** in the sidebar (PIN required).")
+
+if not st.session_state.selected_ticker:
+    home_summary = st.session_state.pop("last_scan_summary", None)
+    if home_summary:
+        st.success(home_summary)
 
 with st.sidebar:
     st.header("Filters")
@@ -570,9 +630,10 @@ active_watch = (
 selected = st.session_state.selected_ticker
 if selected:
     render_company_detail(
+        supabase,
         selected,
         active_watch,
-        events_df,
+        timeframe_days=timeframe_days,
         min_severity=min_severity,
         selected_source=selected_source,
         selected_timeframe=selected_timeframe,

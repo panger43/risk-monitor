@@ -10,6 +10,8 @@ import streamlit as st
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
+from company_catalog import APPROVED_UNIVERSE, default_watchlist_rows
+
 st.set_page_config(page_title="HK Risk Radar", layout="wide")
 
 load_dotenv()
@@ -36,34 +38,51 @@ SOURCE_LABELS: dict[str, str] = {
     "reddit": "Reddit (legacy)",
 }
 
-DEFAULT_COMPANIES: list[dict[str, str]] = [
-    {"name": "Apple Inc.", "ticker": "AAPL"},
-    {"name": "Microsoft Corporation", "ticker": "MSFT"},
-    {"name": "NVIDIA Corporation", "ticker": "NVDA"},
-    {"name": "Tencent Holdings", "ticker": "0700.HK"},
-    {"name": "Alibaba Group", "ticker": "9988.HK"},
-    {"name": "Meituan", "ticker": "3690.HK"},
-    {"name": "Xiaomi Corporation", "ticker": "1810.HK"},
-    {"name": "Baidu Inc.", "ticker": "9888.HK"},
-    {"name": "HSBC Holdings", "ticker": "0005.HK"},
-    {"name": "AIA Group", "ticker": "1299.HK"},
-    {"name": "HKEX (Hong Kong Exchanges)", "ticker": "0388.HK"},
-    {"name": "Sun Hung Kai Properties", "ticker": "0016.HK"},
-    {"name": "MTR Corporation", "ticker": "0066.HK"},
-]
-
 
 @st.cache_resource
 def get_supabase_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+def seed_company_universe(client: Client) -> None:
+    payload = [
+        {
+            "ticker": c["ticker"].upper(),
+            "company_name": c["name"],
+            "exchange": c.get("exchange", ""),
+            "is_approved": True,
+        }
+        for c in APPROVED_UNIVERSE
+    ]
+    client.table("company_universe").upsert(payload, on_conflict="ticker").execute()
+
+
 def seed_watched_companies(client: Client) -> None:
+    seed_company_universe(client)
     payload = [
         {"ticker": c["ticker"].upper(), "company_name": c["name"], "is_active": True}
-        for c in DEFAULT_COMPANIES
+        for c in default_watchlist_rows()
     ]
     client.table("watched_companies").upsert(payload, on_conflict="ticker").execute()
+
+
+def fetch_company_universe(client: Client) -> pd.DataFrame:
+    try:
+        seed_company_universe(client)
+        response = (
+            client.table("company_universe")
+            .select("ticker, company_name, exchange, is_approved")
+            .eq("is_approved", True)
+            .order("ticker")
+            .execute()
+        )
+        return pd.DataFrame(response.data or [])
+    except Exception as exc:
+        st.error(
+            "Could not load `company_universe`. Create the table in Supabase first "
+            f"(see schema.sql). Details: {exc}"
+        )
+        return pd.DataFrame(columns=["ticker", "company_name", "exchange", "is_approved"])
 
 
 def fetch_watched_companies(client: Client) -> pd.DataFrame:
@@ -94,11 +113,16 @@ def fetch_watched_companies(client: Client) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def add_watched_company(client: Client, company_name: str, ticker: str) -> None:
+def add_watched_from_universe(client: Client, ticker: str, universe_df: pd.DataFrame) -> None:
+    """Only approved universe tickers may be added to the watchlist."""
+    match = universe_df[universe_df["ticker"].astype(str).str.upper() == ticker.upper()]
+    if match.empty:
+        raise ValueError(f"{ticker} is not in the approved company universe")
+    row = match.iloc[0]
     client.table("watched_companies").upsert(
         {
-            "ticker": ticker.upper().strip(),
-            "company_name": company_name.strip(),
+            "ticker": str(row["ticker"]).upper(),
+            "company_name": str(row["company_name"]),
             "is_active": True,
         },
         on_conflict="ticker",
@@ -107,7 +131,6 @@ def add_watched_company(client: Client, company_name: str, ticker: str) -> None:
 
 def remove_watched_company(client: Client, ticker: str) -> None:
     client.table("watched_companies").delete().eq("ticker", ticker.upper().strip()).execute()
-
 
 def processed_field(row: pd.Series, field: str) -> str | None:
     src = row.get("processed_sources")
@@ -181,30 +204,57 @@ def render_watchlist_editor(
     client: Client,
     active_watch: pd.DataFrame,
     watched_df: pd.DataFrame,
+    universe_df: pd.DataFrame,
 ) -> None:
     with st.expander("Manage watchlist", expanded=False):
-        st.caption("Changes apply on the next `python risk_monitor.py` run. Past headlines stay in the DB.")
+        st.caption(
+            "Only approved universe names can be added. "
+            "Edits apply on the next `python risk_monitor.py` run."
+        )
 
-        c1, c2, c3 = st.columns([2, 1, 1])
-        with c1:
-            new_name = st.text_input(
-                "Company name",
-                placeholder="Company name",
-                label_visibility="collapsed",
-            )
-        with c2:
-            new_ticker = st.text_input(
-                "Ticker",
-                placeholder="Ticker",
-                label_visibility="collapsed",
-            )
-        with c3:
-            if st.button("Add", use_container_width=True):
-                if not new_name.strip() or not new_ticker.strip():
-                    st.warning("Name and ticker required.")
-                else:
-                    add_watched_company(client, new_name, new_ticker)
+        watched_tickers = set(
+            watched_df["ticker"].astype(str).str.upper().tolist()
+            if not watched_df.empty and "ticker" in watched_df.columns
+            else []
+        )
+        available = (
+            universe_df[~universe_df["ticker"].astype(str).str.upper().isin(watched_tickers)].copy()
+            if not universe_df.empty
+            else pd.DataFrame()
+        )
+
+        universe_query = st.text_input(
+            "Find approved company",
+            placeholder="Search universe by name or ticker...",
+            key="universe_add_search",
+        )
+        if not available.empty and universe_query.strip():
+            q = universe_query.strip().lower()
+            available = available[
+                available["company_name"].astype(str).str.lower().str.contains(q)
+                | available["ticker"].astype(str).str.lower().str.contains(q)
+            ]
+
+        if available.empty:
+            st.caption("No approved companies left to add (or no search matches).")
+        else:
+            labels = [
+                f"{row.company_name} ({row.ticker})"
+                + (f" · {row.exchange}" if getattr(row, "exchange", None) else "")
+                for row in available.itertuples()
+            ]
+            label_to_ticker = {
+                f"{row.company_name} ({row.ticker})"
+                + (f" · {row.exchange}" if getattr(row, "exchange", None) else ""): str(row.ticker)
+                for row in available.itertuples()
+            }
+            chosen = st.selectbox("Add from approved universe", options=labels)
+            if st.button("Add to watchlist", use_container_width=True):
+                try:
+                    add_watched_from_universe(client, label_to_ticker[chosen], universe_df)
                     st.rerun()
+                except Exception as exc:
+                    st.error(f"Failed to add: {exc}")
 
         all_tickers = (
             watched_df["ticker"].tolist()
@@ -226,25 +276,18 @@ def render_company_home(
     client: Client,
     active_watch: pd.DataFrame,
     watched_df: pd.DataFrame,
+    universe_df: pd.DataFrame,
     events_df: pd.DataFrame,
     min_severity: int,
+    search_query: str,
 ) -> None:
     st.subheader("Companies")
-    
-    # --- SEARCH / FILTER BAR ---
-    search_query = st.text_input(
-        "Search companies",
-        placeholder="Search by company name or ticker (e.g., Tencent, HSBC, 0700.HK)...",
-        label_visibility="collapsed",
-    )
-
-    render_watchlist_editor(client, active_watch, watched_df)
+    render_watchlist_editor(client, active_watch, watched_df, universe_df)
 
     if active_watch.empty:
-        st.info("No active companies. Open **Manage watchlist** above to add one.")
+        st.info("No active companies. Open **Manage watchlist** to add an approved name.")
         return
 
-    # Filter active companies by search query if provided
     filtered_watch = active_watch.copy()
     if search_query.strip():
         q = search_query.strip().lower()
@@ -294,7 +337,6 @@ def render_company_home(
                 if st.button("Open", key=f"open_{company.ticker}", use_container_width=True):
                     st.session_state.selected_ticker = company.ticker
                     st.rerun()
-
 
 def render_company_detail(
     ticker: str,
@@ -349,6 +391,10 @@ st.title("HK Risk Radar")
 # Sidebar — keep it minimal
 with st.sidebar:
     st.header("Filters")
+    search_query = st.text_input(
+        "Search companies",
+        placeholder="Name or ticker...",
+    )
     selected_timeframe = st.selectbox(
         "Time frame",
         options=list(TIMEFRAME_OPTIONS.keys()),
@@ -368,6 +414,7 @@ with st.sidebar:
         st.rerun()
 
 watched_df = fetch_watched_companies(supabase)
+universe_df = fetch_company_universe(supabase)
 active_watch = (
     watched_df[watched_df["is_active"] == True]  # noqa: E712
     if not watched_df.empty and "is_active" in watched_df.columns
@@ -385,4 +432,12 @@ if selected:
         selected_timeframe=selected_timeframe,
     )
 else:
-    render_company_home(supabase, active_watch, watched_df, events_df, min_severity)
+    render_company_home(
+        supabase,
+        active_watch,
+        watched_df,
+        universe_df,
+        events_df,
+        min_severity,
+        search_query,
+    )

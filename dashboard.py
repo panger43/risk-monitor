@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -18,6 +19,8 @@ st.set_page_config(page_title="Primas Asset Management Risk Radar", layout="wide
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/").removesuffix("/rest/v1")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
+TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,15}$")
 
 TIMEFRAME_OPTIONS: dict[str, int] = {
     "Last 24 hours": 1,
@@ -148,6 +151,94 @@ def trigger_scan(*, tickers: list[str] | None = None) -> None:
         f"{result['processed']} processed, {result['skipped']} skipped, {result['errors']} errors"
     )
     st.rerun()
+
+
+def upsert_universe_company(client: Client, *, name: str, ticker: str, exchange: str) -> None:
+    client.table("company_universe").upsert(
+        {
+            "ticker": ticker,
+            "company_name": name,
+            "exchange": exchange,
+            "is_approved": True,
+        },
+        on_conflict="ticker",
+    ).execute()
+
+
+def render_admin_view(client: Client) -> None:
+    """PIN-gated universe approvals — in-app view (no Streamlit multipage)."""
+    st.title("Admin · Company universe")
+    st.caption(
+        "Adds an **approved** company for Manage watchlist. "
+        "Does not auto-scan — add to watchlist, then run a scan."
+    )
+
+    if not ADMIN_PIN:
+        st.error("Admin is disabled. Set `ADMIN_PIN` in your Streamlit secrets / `.env`.")
+        return
+
+    if not st.session_state.get("admin_ok"):
+        st.subheader("Admin login")
+        pin = st.text_input("Admin PIN", type="password", key="admin_pin_input")
+        if st.button("Unlock", type="primary"):
+            if pin == ADMIN_PIN:
+                st.session_state.admin_ok = True
+                st.rerun()
+            st.error("Wrong PIN.")
+        return
+
+    if st.button("Lock admin"):
+        st.session_state.admin_ok = False
+        st.rerun()
+
+    st.divider()
+    with st.form("add_universe_form", clear_on_submit=True):
+        name = st.text_input("Company name", placeholder="BYD Company Limited")
+        ticker = st.text_input("Ticker", placeholder="1211.HK or COST")
+        exchange = st.selectbox("Exchange", options=["HK", "US", "OTHER"])
+        submitted = st.form_submit_button("Approve into universe", type="primary")
+
+    if submitted:
+        clean_name = name.strip()
+        clean_ticker = ticker.strip().upper()
+        if not clean_name or not clean_ticker:
+            st.warning("Name and ticker are required.")
+        elif not TICKER_RE.match(clean_ticker):
+            st.warning("Ticker looks invalid. Use something like `AAPL` or `0700.HK`.")
+        else:
+            try:
+                upsert_universe_company(
+                    client,
+                    name=clean_name,
+                    ticker=clean_ticker,
+                    exchange=exchange,
+                )
+                st.success(
+                    f"Approved `{clean_ticker}` — {clean_name}. "
+                    "Go back to Companies → Manage watchlist → Add, then scan."
+                )
+            except Exception as exc:
+                st.error(f"Failed to save: {exc}")
+
+    st.divider()
+    st.subheader("Currently approved (sample)")
+    try:
+        rows = (
+            client.table("company_universe")
+            .select("ticker, company_name, exchange, is_approved")
+            .eq("is_approved", True)
+            .order("ticker")
+            .limit(50)
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Universe is empty — seed from the main dashboard or add above.")
+    except Exception as exc:
+        st.error(f"Could not load universe: {exc}")
 
 
 def processed_field(row: pd.Series, field: str) -> str | None:
@@ -414,15 +505,29 @@ supabase = get_supabase_client()
 
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = None
+if "app_view" not in st.session_state:
+    st.session_state.app_view = "home"
+
+# Sidebar navigation (in-app views — works on Streamlit Cloud)
+with st.sidebar:
+    if st.session_state.app_view == "admin":
+        if st.button("← Companies", use_container_width=True):
+            st.session_state.app_view = "home"
+            st.rerun()
+    else:
+        if st.button("Admin", use_container_width=True):
+            st.session_state.app_view = "admin"
+            st.rerun()
+    st.divider()
+
+if st.session_state.app_view == "admin":
+    render_admin_view(supabase)
+    st.stop()
 
 st.title("Primas Asset Management Risk Radar")
-st.caption("Approve new companies via **Admin** (sidebar). PIN required.")
+st.caption("Approve new companies via **Admin** in the sidebar (PIN required).")
 
-# Sidebar — keep it minimal
 with st.sidebar:
-    if st.button("Admin", use_container_width=True):
-        st.switch_page("pages/Admin.py")
-    st.divider()
     st.header("Filters")
     search_query = st.text_input(
         "Search companies",

@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 from company_catalog import APPROVED_UNIVERSE, default_watchlist_rows
+from risk_monitor import run_scan
 
 st.set_page_config(page_title="HK Risk Radar", layout="wide")
 
@@ -131,6 +132,23 @@ def add_watched_from_universe(client: Client, ticker: str, universe_df: pd.DataF
 
 def remove_watched_company(client: Client, ticker: str) -> None:
     client.table("watched_companies").delete().eq("ticker", ticker.upper().strip()).execute()
+
+
+def trigger_scan(*, tickers: list[str] | None = None) -> None:
+    """Run full watchlist scan (tickers=None) or selected tickers only."""
+    label = "full watchlist" if tickers is None else ", ".join(tickers)
+    with st.spinner(f"Scanning {label}… this can take a few minutes"):
+        try:
+            result = run_scan(tickers=tickers)
+        except Exception as exc:
+            st.error(f"Scan failed: {exc}")
+            return
+    st.success(
+        f"Scan done ({result['scope']}): "
+        f"{result['processed']} processed, {result['skipped']} skipped, {result['errors']} errors"
+    )
+    st.rerun()
+
 
 def processed_field(row: pd.Series, field: str) -> str | None:
     src = row.get("processed_sources")
@@ -281,7 +299,13 @@ def render_company_home(
     min_severity: int,
     search_query: str,
 ) -> None:
-    st.subheader("Companies")
+    head_l, head_r = st.columns([3, 1])
+    with head_l:
+        st.subheader("Companies")
+    with head_r:
+        if st.button("Run full scan", use_container_width=True, type="primary"):
+            trigger_scan(tickers=None)
+
     render_watchlist_editor(client, active_watch, watched_df, universe_df)
 
     if active_watch.empty:
@@ -350,9 +374,14 @@ def render_company_detail(
     name_series = active_watch.loc[active_watch["ticker"] == ticker, "company_name"]
     company_name = str(name_series.iloc[0]) if not name_series.empty else ticker
 
-    if st.button("← Companies"):
-        st.session_state.selected_ticker = None
-        st.rerun()
+    nav_l, nav_r = st.columns([1, 1])
+    with nav_l:
+        if st.button("← Companies"):
+            st.session_state.selected_ticker = None
+            st.rerun()
+    with nav_r:
+        if st.button("Scan this company", use_container_width=True, type="primary"):
+            trigger_scan(tickers=[ticker])
 
     st.subheader(f"{company_name}")
     st.caption(f"`{ticker}` · {selected_timeframe}")
@@ -374,7 +403,7 @@ def render_company_detail(
     m3.metric("Mild (<6)", int((company_events["severity_score"] < 6).sum()) if not company_events.empty else 0)
 
     if company_events.empty:
-        st.info("No headlines here yet. Run `python risk_monitor.py` after adding this ticker.")
+        st.info("No headlines here yet. Use **Scan this company** to pull fresh coverage.")
         return
 
     for _, row in company_events.iterrows():

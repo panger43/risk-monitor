@@ -21,8 +21,17 @@ CREATE TABLE IF NOT EXISTS risk_events (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS watched_companies (
+-- Approved names only. UI can watch these; it cannot invent new tickers.
+CREATE TABLE IF NOT EXISTS company_universe (
     ticker TEXT PRIMARY KEY,
+    company_name TEXT NOT NULL,
+    exchange TEXT,
+    is_approved BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS watched_companies (
+    ticker TEXT PRIMARY KEY REFERENCES company_universe(ticker),
     company_name TEXT NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -37,13 +46,15 @@ CREATE INDEX IF NOT EXISTS idx_risk_events_published_at
 CREATE INDEX IF NOT EXISTS idx_watched_companies_active
     ON watched_companies(is_active);
 
--- Run once on existing projects that already created the tables:
--- ALTER TABLE risk_events ADD COLUMN IF NOT EXISTS url TEXT;
--- ALTER TABLE risk_events ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
--- CREATE INDEX IF NOT EXISTS idx_risk_events_published_at ON risk_events(published_at DESC);
--- CREATE TABLE IF NOT EXISTS watched_companies (
+CREATE INDEX IF NOT EXISTS idx_company_universe_approved
+    ON company_universe(is_approved);
+
+-- Run once on existing projects:
+-- CREATE TABLE IF NOT EXISTS company_universe (
 --     ticker TEXT PRIMARY KEY,
 --     company_name TEXT NOT NULL,
---     is_active BOOLEAN NOT NULL DEFAULT TRUE,
+--     exchange TEXT,
+--     is_approved BOOLEAN NOT NULL DEFAULT TRUE,
 --     created_at TIMESTAMPTZ DEFAULT NOW()
 -- );
+-- Then seed universe before adding the FK on watched_companies if the table already exists.

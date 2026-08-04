@@ -22,6 +22,8 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
+from company_catalog import APPROVED_UNIVERSE, default_watchlist_rows
+
 # ==================== NETWORK & TIMEOUT CONFIGURATION ====================
 socket.setdefaulttimeout(5.0)
 
@@ -48,27 +50,6 @@ ALERT_THRESHOLD = 1
 
 _print_lock = Lock()
 _db_lock = Lock()
-
-# ==================== DEFAULT WATCHLIST (seeded into Supabase if empty) ====================
-DEFAULT_COMPANIES: list[dict[str, str]] = [
-    # US Companies
-    {"name": "Apple Inc.", "ticker": "AAPL"},
-    {"name": "Microsoft Corporation", "ticker": "MSFT"},
-    {"name": "NVIDIA Corporation", "ticker": "NVDA"},
-    # Hong Kong Tech & Internet
-    {"name": "Tencent Holdings", "ticker": "0700.HK"},
-    {"name": "Alibaba Group", "ticker": "9988.HK"},
-    {"name": "Meituan", "ticker": "3690.HK"},
-    {"name": "Xiaomi Corporation", "ticker": "1810.HK"},
-    {"name": "Baidu Inc.", "ticker": "9888.HK"},
-    # Hong Kong Finance & Exchanges
-    {"name": "HSBC Holdings", "ticker": "0005.HK"},
-    {"name": "AIA Group", "ticker": "1299.HK"},
-    {"name": "HKEX (Hong Kong Exchanges)", "ticker": "0388.HK"},
-    # Hong Kong Real Estate & Conglomerates
-    {"name": "Sun Hung Kai Properties", "ticker": "0016.HK"},
-    {"name": "MTR Corporation", "ticker": "0066.HK"},
-]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -484,16 +465,35 @@ def collect_all_work_items(
     return work_items
 
 
+def seed_company_universe(supabase: Client) -> None:
+    payload = [
+        {
+            "ticker": c["ticker"].upper(),
+            "company_name": c["name"],
+            "exchange": c.get("exchange", ""),
+            "is_approved": True,
+        }
+        for c in APPROVED_UNIVERSE
+    ]
+    supabase.table("company_universe").upsert(payload, on_conflict="ticker").execute()
+
+
 def seed_watched_companies(supabase: Client) -> None:
+    seed_company_universe(supabase)
     payload = [
         {"ticker": c["ticker"].upper(), "company_name": c["name"], "is_active": True}
-        for c in DEFAULT_COMPANIES
+        for c in default_watchlist_rows()
     ]
     supabase.table("watched_companies").upsert(payload, on_conflict="ticker").execute()
 
 
 def load_watched_companies(supabase: Client) -> list[dict[str, str]]:
-    """Load active watchlist from Supabase; seed defaults if the table is empty."""
+    """Load active watchlist from Supabase; seed universe + defaults if empty."""
+    try:
+        seed_company_universe(supabase)
+    except Exception as exc:
+        logger.warning("Could not seed company_universe (create table if missing): %s", exc)
+
     response = (
         supabase.table("watched_companies")
         .select("ticker, company_name, is_active")
@@ -503,7 +503,7 @@ def load_watched_companies(supabase: Client) -> list[dict[str, str]]:
     )
     rows = response.data or []
     if not rows:
-        logger.info("Watchlist empty — seeding default companies into watched_companies")
+        logger.info("Watchlist empty — seeding default watchlist")
         seed_watched_companies(supabase)
         response = (
             supabase.table("watched_companies")
@@ -520,8 +520,8 @@ def load_watched_companies(supabase: Client) -> list[dict[str, str]]:
         if row.get("company_name") and row.get("ticker")
     ]
     if not companies:
-        logger.warning("No active watched companies found; falling back to DEFAULT_COMPANIES")
-        return list(DEFAULT_COMPANIES)
+        logger.warning("No active watched companies found; falling back to catalog defaults")
+        return default_watchlist_rows()
     return companies
 
 

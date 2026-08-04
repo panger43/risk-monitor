@@ -10,7 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import quote_plus
 
 import feedparser
@@ -525,14 +525,26 @@ def load_watched_companies(supabase: Client) -> list[dict[str, str]]:
     return companies
 
 
-def run_scan(*, tickers: list[str] | None = None) -> dict[str, object]:
+def run_scan(
+    *,
+    tickers: list[str] | None = None,
+    on_progress: Callable[[float, str], None] | None = None,
+) -> dict[str, object]:
     """
     Run a risk scan.
 
     tickers:
       - None  -> full active watchlist
       - [...] -> only those tickers (must be on the active watchlist)
+
+    on_progress:
+      Optional callback(fraction_0_to_1, status_message) for UI progress bars.
     """
+
+    def report(fraction: float, message: str) -> None:
+        if on_progress is not None:
+            on_progress(max(0.0, min(1.0, fraction)), message)
+
     config = load_config()
     supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_SERVICE_ROLE_KEY"])
     openai_client = OpenAI(api_key=config["OPENROUTER_API_KEY"], base_url=OPENROUTER_BASE_URL)
@@ -554,6 +566,7 @@ def run_scan(*, tickers: list[str] | None = None) -> dict[str, object]:
     print(f" Parallelism: {MAX_FEED_WORKERS} feed workers / {MAX_ARTICLE_WORKERS} article workers")
     print("=" * 70)
 
+    report(0.02, f"Fetching feeds for {len(companies)} companies…")
     logger.info("Fetching RSS feeds in parallel for %d companies...", len(companies))
     work_items = collect_all_work_items(companies)
     logger.info("Queued %d articles for scrape + LLM classification", len(work_items))
@@ -561,6 +574,12 @@ def run_scan(*, tickers: list[str] | None = None) -> dict[str, object]:
     processed = 0
     skipped = 0
     errors = 0
+    total = len(work_items)
+
+    if total == 0:
+        report(1.0, "No new articles to process")
+    else:
+        report(0.08, f"Queued {total} articles — classifying…")
 
     with ThreadPoolExecutor(max_workers=MAX_ARTICLE_WORKERS) as pool:
         futures = [
@@ -574,6 +593,7 @@ def run_scan(*, tickers: list[str] | None = None) -> dict[str, object]:
             )
             for name, ticker, entry in work_items
         ]
+        finished = 0
         for future in as_completed(futures):
             try:
                 result = future.result()
@@ -585,6 +605,16 @@ def run_scan(*, tickers: list[str] | None = None) -> dict[str, object]:
                 errors += 1
                 logger.error("Article processing failed: %s", exc)
 
+            finished += 1
+            if total:
+                # Reserve 8% for feed fetch; remainder for article work.
+                fraction = 0.08 + 0.92 * (finished / total)
+                report(
+                    fraction,
+                    f"Articles {finished}/{total} · processed {processed} · skipped {skipped} · errors {errors}",
+                )
+
+    report(1.0, "Scan complete")
     print("\n" + "=" * 70)
     print(" RUN COMPLETE - All findings recorded in Supabase")
     print(f" Processed: {processed} | Skipped duplicates: {skipped} | Errors: {errors}")

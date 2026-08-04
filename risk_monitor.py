@@ -525,20 +525,36 @@ def load_watched_companies(supabase: Client) -> list[dict[str, str]]:
     return companies
 
 
-def run() -> int:
+def run_scan(*, tickers: list[str] | None = None) -> dict[str, object]:
+    """
+    Run a risk scan.
+
+    tickers:
+      - None  -> full active watchlist
+      - [...] -> only those tickers (must be on the active watchlist)
+    """
     config = load_config()
     supabase = create_client(config["SUPABASE_URL"], config["SUPABASE_SERVICE_ROLE_KEY"])
     openai_client = OpenAI(api_key=config["OPENROUTER_API_KEY"], base_url=OPENROUTER_BASE_URL)
     companies = load_watched_companies(supabase)
 
+    if tickers is not None:
+        wanted = {t.upper().strip() for t in tickers if t.strip()}
+        companies = [c for c in companies if c["ticker"].upper() in wanted]
+        if not companies:
+            raise RuntimeError(
+                "No matching active watchlist companies for: " + ", ".join(sorted(wanted))
+            )
+
+    scope = "FULL WATCHLIST" if tickers is None else "SELECTED COMPANIES"
     print("\n" + "=" * 70)
-    print(" STARTING PORTFOLIO RISK SCAN")
+    print(f" STARTING PORTFOLIO RISK SCAN ({scope})")
     print(f" Target Companies: {len(companies)}")
     print(f" Watchlist: {', '.join(c['ticker'] for c in companies)}")
     print(f" Parallelism: {MAX_FEED_WORKERS} feed workers / {MAX_ARTICLE_WORKERS} article workers")
     print("=" * 70)
 
-    logger.info("Fetching all RSS feeds in parallel...")
+    logger.info("Fetching RSS feeds in parallel for %d companies...", len(companies))
     work_items = collect_all_work_items(companies)
     logger.info("Queued %d articles for scrape + LLM classification", len(work_items))
 
@@ -573,6 +589,19 @@ def run() -> int:
     print(" RUN COMPLETE - All findings recorded in Supabase")
     print(f" Processed: {processed} | Skipped duplicates: {skipped} | Errors: {errors}")
     print("=" * 70 + "\n")
+
+    return {
+        "scope": scope,
+        "companies": [c["ticker"] for c in companies],
+        "queued": len(work_items),
+        "processed": processed,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def run() -> int:
+    run_scan(tickers=None)
     return 0
 
 

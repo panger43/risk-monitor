@@ -422,20 +422,18 @@ def render_company_home(
         ticker = str(row.ticker)
         company_events = scoped[scoped["ticker"] == ticker] if not scoped.empty else pd.DataFrame()
         max_sev = int(company_events["severity_score"].max()) if not company_events.empty else 0
-        high = int((company_events["severity_score"] >= 6).sum()) if not company_events.empty else 0
         company_rows.append(
             {
                 "ticker": ticker,
                 "company_name": row.company_name,
                 "events": len(company_events),
                 "max_severity": max_sev,
-                "high_risks": high,
             }
         )
 
     summary = pd.DataFrame(company_rows).sort_values(
-        by=["max_severity", "high_risks", "events", "ticker"],
-        ascending=[False, False, False, True],
+        by=["max_severity", "events", "ticker"],
+        ascending=[False, False, True],
         kind="mergesort",
     )
 
@@ -445,10 +443,10 @@ def render_company_home(
             with st.container(border=True):
                 st.markdown(f"### `{company.ticker}`")
                 st.caption(company.company_name)
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Events", company.events)
-                m2.metric("Max", company.max_severity if company.events else "—")
-                m3.metric("High", company.high_risks)
+                if company.events:
+                    st.write(f"**{company.events}** headline{'s' if company.events != 1 else ''}")
+                else:
+                    st.caption("No headlines in this window")
                 if st.button("Open", key=f"open_{company.ticker}", use_container_width=True):
                     st.session_state.selected_ticker = company.ticker
                     st.rerun()

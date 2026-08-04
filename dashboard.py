@@ -13,7 +13,7 @@ from supabase import Client, create_client
 from company_catalog import APPROVED_UNIVERSE, default_watchlist_rows
 from risk_monitor import run_scan
 
-st.set_page_config(page_title="HK Risk Radar", layout="wide")
+st.set_page_config(page_title="Primas Asset Management Risk Radar", layout="wide")
 
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/").removesuffix("/rest/v1")
@@ -415,7 +415,8 @@ supabase = get_supabase_client()
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = None
 
-st.title("HK Risk Radar")
+st.title("Primas Asset Management Risk Radar")
+st.caption("Use the sidebar page **Admin** to approve new companies into the universe (PIN required).")
 
 # Sidebar — keep it minimal
 with st.sidebar:

@@ -416,10 +416,13 @@ if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = None
 
 st.title("Primas Asset Management Risk Radar")
-st.caption("Use the sidebar page **Admin** to approve new companies into the universe (PIN required).")
+st.caption("Approve new companies via **Admin** (sidebar link or page nav). PIN required.")
 
 # Sidebar — keep it minimal
 with st.sidebar:
+    st.page_link("dashboard.py", label="Companies", icon=":material/home:")
+    st.page_link("pages/Admin.py", label="Admin", icon=":material/admin_panel_settings:")
+    st.divider()
     st.header("Filters")
     search_query = st.text_input(
         "Search companies",

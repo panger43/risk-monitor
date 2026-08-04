@@ -36,6 +36,7 @@ def require_admin() -> bool:
         return True
 
     st.title("Admin login")
+    st.page_link("dashboard.py", label="← Back to Companies")
     st.caption("Only for approving names into the company universe.")
     pin = st.text_input("Admin PIN", type="password")
     if st.button("Unlock", type="primary", use_container_width=True):
@@ -63,6 +64,7 @@ def upsert_universe_company(*, name: str, ticker: str, exchange: str) -> None:
 require_admin()
 
 st.title("Admin · Company universe")
+st.page_link("dashboard.py", label="← Back to Companies", icon=":material/arrow_back:")
 st.caption(
     "Adds an **approved** company so it can be selected in Manage watchlist. "
     "Does **not** auto-start research — add it to the watchlist afterward, then scan."

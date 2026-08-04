@@ -140,12 +140,22 @@ def remove_watched_company(client: Client, ticker: str) -> None:
 def trigger_scan(*, tickers: list[str] | None = None) -> None:
     """Run full watchlist scan (tickers=None) or selected tickers only."""
     label = "full watchlist" if tickers is None else ", ".join(tickers)
-    with st.spinner(f"Scanning {label}… this can take a few minutes"):
-        try:
-            result = run_scan(tickers=tickers)
-        except Exception as exc:
-            st.error(f"Scan failed: {exc}")
-            return
+    st.info(f"Scanning {label}…")
+    progress = st.progress(0, text="Starting scan…")
+    status = st.empty()
+
+    def on_progress(fraction: float, message: str) -> None:
+        progress.progress(fraction, text=message)
+        status.caption(message)
+
+    try:
+        result = run_scan(tickers=tickers, on_progress=on_progress)
+    except Exception as exc:
+        progress.progress(1.0, text="Scan failed")
+        st.error(f"Scan failed: {exc}")
+        return
+
+    progress.progress(1.0, text="Scan complete")
     st.success(
         f"Scan done ({result['scope']}): "
         f"{result['processed']} processed, {result['skipped']} skipped, {result['errors']} errors"

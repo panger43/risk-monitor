@@ -28,7 +28,6 @@ TIMEFRAME_OPTIONS: dict[str, int] = {
     "Last 7 days": 7,
     "Last 14 days": 14,
     "Last 30 days": 30,
-    "Last 3 months": 90,
 }
 
 SOURCE_LABELS: dict[str, str] = {
@@ -286,13 +285,12 @@ def _normalize_events_df(df: pd.DataFrame, timeframe_days: int) -> pd.DataFrame:
         lambda s: SOURCE_LABELS.get(s, str(s).replace("_", " ").title())
     )
     published = pd.to_datetime(df.get("published_at"), utc=True, errors="coerce")
-    created = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
-    df["event_at"] = published.fillna(created)
+    # UI time frames are publish-date only (not when we ingested the row).
+    df["event_at"] = published
     df["ticker"] = df["ticker"].astype(str).str.upper()
     cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(days=timeframe_days))
-    recently_published = df["event_at"] >= cutoff
-    recently_ingested = created >= cutoff
-    return df[recently_published | recently_ingested].copy()
+    # Drop rows with no publish date from time-filtered views.
+    return df[df["event_at"].notna() & (df["event_at"] >= cutoff)].copy()
 
 
 def _fetch_risk_event_rows(client: Client, *, ticker: str | None = None, limit: int = 500) -> list[dict]:
@@ -553,8 +551,8 @@ def render_company_detail(
         raw = _fetch_risk_event_rows(client, ticker=ticker_key, limit=5)
         if raw:
             st.warning(
-                f"Found {len(raw)}+ rows in the database for `{ticker_key}`, but none match "
-                f"the current time/severity/source filters. Try **Last 3 months** or lower min severity."
+                f"Found rows in the database for `{ticker_key}`, but none were **published** "
+                f"inside **{selected_timeframe}**. Widen the time frame or scan again for newer articles."
             )
         else:
             st.info("No headlines in the database for this ticker yet. Run **Scan this company**.")
@@ -606,6 +604,7 @@ with st.sidebar:
         options=list(TIMEFRAME_OPTIONS.keys()),
         index=2,
     )
+    st.caption("Based on article publish date. Scanner stores ~last 30 days only.")
     timeframe_days = TIMEFRAME_OPTIONS[selected_timeframe]
     min_severity = st.slider("Min severity", 1, 10, 1)
 

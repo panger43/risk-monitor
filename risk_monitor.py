@@ -36,7 +36,7 @@ TRAFILATURA_CONFIG.set(
 )
 
 MAX_ITEMS_PER_FEED = 5
-MAX_AGE_DAYS = 90  # Ingest ceiling; dashboard UI filters within this window
+MAX_AGE_DAYS = 30  # Only ingest articles published within the last month
 MAX_ARTICLE_CHARS = 8_000
 MAX_FEED_WORKERS = 12
 MAX_ARTICLE_WORKERS = 8
@@ -181,8 +181,9 @@ def entry_published_at(entry: Any) -> datetime | None:
 
 
 def is_recent_enough(published_at: datetime | None, source_type: SourceType) -> bool:
-    """Keep only recent items. Undated social/news is dropped; undated filings kept."""
+    """Keep only items published within MAX_AGE_DAYS. Undated non-filing items are dropped."""
     if published_at is None:
+        # Filings feeds are short-window; undated news/social is too risky to store.
         return source_type in ("sec_8k", "hkex_announcements")
     cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
     return published_at >= cutoff

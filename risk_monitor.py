@@ -60,19 +60,32 @@ logger = logging.getLogger(__name__)
 
 
 class RiskAssessment(BaseModel):
+    relevance: Literal["primary", "secondary", "mention_only"] = Field(
+        description=(
+            "primary = company is a main subject of the article; "
+            "secondary = meaningfully discussed but not the focus; "
+            "mention_only = passing/name-check/peer-list mention only."
+        )
+    )
     is_negative_event: bool = Field(
-        description="True if there is ANY negative sentiment, concern, risk, controversy, or friction (even slight)."
+        description=(
+            "True only if this is a material downside/risk for the named company AND relevance is primary "
+            "(or clearly company-specific secondary). False for tangential mentions and market roundups."
+        )
     )
     severity_score: int = Field(
         ge=1,
         le=10,
-        description="Severity score (1-3 = Economic/market noise, 4-5 = Operational friction, 6-10 = Regulatory/political/criminal risk).",
+        description="Severity score (1-3 = Economic/market noise, 4-5 = Operational friction, 6-10 = Regulatory/political/criminal risk). Use 1 if mention_only.",
     )
     category: str = Field(
-        description="Risk category, e.g. regulatory, political, bribery-corruption, litigation, executive, operational, market-concern, economic."
+        description=(
+            "Risk category, e.g. regulatory, political, bribery-corruption, litigation, executive, "
+            "operational, market-concern, economic, or irrelevant."
+        )
     )
     key_impact: str = Field(
-        description="1-2 sentences summarizing the potential downside or negative sentiment."
+        description="1-2 sentences on company-specific impact. If mention_only, say it is not company-focused."
     )
 
 
@@ -85,6 +98,35 @@ SourceType = Literal[
     "sec_8k",
     "hkex_announcements",
 ]
+
+# Sources that often return tangential hits — require company/ticker in the headline.
+NOISY_SOURCE_TYPES: frozenset[str] = frozenset(
+    {"google_news", "major_wires", "pr_newswire", "business_wire"}
+)
+_NAME_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "inc",
+        "inc.",
+        "corp",
+        "corp.",
+        "corporation",
+        "ltd",
+        "ltd.",
+        "limited",
+        "holdings",
+        "group",
+        "company",
+        "the",
+        "and",
+        "of",
+        "co",
+        "co.",
+        "plc",
+        "sa",
+        "ag",
+        "nv",
+    }
+)
 
 
 def load_config() -> dict[str, str]:
@@ -259,6 +301,30 @@ def scrape_article_text(url: str) -> str | None:
         return None
 
 
+def headline_mentions_company(title: str, company_name: str, ticker: str) -> bool:
+    """True if headline likely refers to this company (not a buried body mention)."""
+    headline = title.lower()
+    ticker_l = ticker.lower().strip()
+    ticker_base = ticker_l.split(".", 1)[0]
+    if ticker_l and ticker_l in headline:
+        return True
+    if ticker_base and len(ticker_base) >= 2 and ticker_base in headline:
+        return True
+
+    name = company_name.lower().strip()
+    if name and name in headline:
+        return True
+
+    # Strip legal suffixes / exchange tags: "Alibaba Group (HK)" -> alibaba
+    cleaned = name.replace("(", " ").replace(")", " ").replace(",", " ")
+    tokens = [
+        tok.strip(".,")
+        for tok in cleaned.split()
+        if tok.strip(".,") and tok.strip(".,") not in _NAME_STOPWORDS and len(tok.strip(".,")) > 2
+    ]
+    return bool(tokens) and tokens[0] in headline
+
+
 def assess_risk(
     client: OpenAI,
     *,
@@ -275,30 +341,32 @@ def assess_risk(
             {
                 "role": "system",
                 "content": (
-                    "You are an early-warning hedge fund risk analyst evaluating risk for portfolio companies.\n\n"
-                    "=== SEVERITY SCORING GUIDELINES ===\n"
-                    "Evaluate events strictly on this calibrated scale:\n\n"
-                    "1. HIGH SEVERITY (Score 6 - 10) -> REGULATORY, POLITICAL, LEGAL, & FINANCIAL CRIME:\n"
-                    "   - Government sanctions, geopolitical bans, or political scrutiny.\n"
-                    "   - SEC/SFC/DOJ/ICAC investigations, antitrust probes, enforcement actions, or bans.\n"
-                    "   - Bribery, corruption, bank loan fraud, employee theft, or criminal convictions.\n"
-                    "   - Material class-action lawsuits, major patent disputes, or short-seller fraud attacks.\n"
-                    "   - Abrupt executive departures (CEO/CFO), auditor resignations, or board disputes.\n\n"
-                    "2. MODERATE SEVERITY (Score 4 - 5) -> OPERATIONAL & STRATEGIC FRICTION:\n"
-                    "   - Product launch delays, key contract cancellations, or supply chain bottlenecks.\n"
-                    "   - Direct earnings/revenue misses or guidance downgrades.\n\n"
-                    "3. LOW SEVERITY (Score 1 - 3) -> ECONOMIC & BROAD MARKET NOISE:\n"
-                    "   - Macroeconomic data, interest rate shifts, inflation concerns, or currency fluctuations.\n"
-                    "   - General market sell-offs, sector headwinds, or minor analyst target price trims.\n"
-                    "   - Mild rumors or speculative commentary.\n\n"
-                    "EVALUATION INSTRUCTION:\n"
-                    "If the content mentions ANY negative sentiment or downside risk, set is_negative_event = True, "
-                    "assign a severity_score following the guidelines above, categorize the event, and provide a 1-2 sentence impact summary."
+                    "You are an early-warning hedge fund risk analyst for ONE named portfolio company.\n\n"
+                    "=== RELEVANCE (do this first) ===\n"
+                    "Classify how central the named company is:\n"
+                    "- primary: the article is mainly about this company (headline/focus is the company).\n"
+                    "- secondary: the company is discussed with substance, but is not the main focus.\n"
+                    "- mention_only: passing mention, peer list, 'stocks moving today', sector roundup, "
+                    "or the company is named without being the story.\n\n"
+                    "If relevance is mention_only: set is_negative_event=false, severity_score=1, "
+                    "category=irrelevant, and say the piece is not company-focused.\n\n"
+                    "Only treat as a portfolio risk when relevance is primary "
+                    "(secondary only if the downside is clearly company-specific).\n\n"
+                    "=== SEVERITY (only if company-relevant) ===\n"
+                    "1. HIGH (6-10): regulatory/political/legal/financial crime, major litigation, "
+                    "abrupt CEO/CFO exit, auditor resignation.\n"
+                    "2. MODERATE (4-5): operational/strategic friction, guidance cut, contract loss.\n"
+                    "3. LOW (1-3): broad macro/market noise that is still primarily about this company.\n\n"
+                    "Reject false positives: articles that only slightly mention the company are NOT risks."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Company: {company_name} ({ticker})\nHeadline: {title}\n\nContent:\n{truncated}",
+                "content": (
+                    f"Target company: {company_name} ({ticker})\n"
+                    f"Headline: {title}\n\n"
+                    f"Content:\n{truncated}"
+                ),
             },
         ],
         response_format=RiskAssessment,
@@ -391,6 +459,26 @@ def process_entry(
         if already_processed(supabase, url_hash):
             return "skipped"
 
+    # Cheap reject: noisy feeds whose headline never names the company/ticker.
+    if source_type in NOISY_SOURCE_TYPES and not headline_mentions_company(title, company_name, ticker):
+        logger.info(
+            "Skipping off-headline %s hit for %s: %s",
+            source_type,
+            ticker,
+            title[:80],
+        )
+        with _db_lock:
+            if already_processed(supabase, url_hash):
+                return "skipped"
+            insert_processed_source(
+                supabase,
+                url_hash=url_hash,
+                url=url,
+                title=title or "(irrelevant headline)",
+                source_type=source_type,
+            )
+        return "skipped"
+
     article_text = scrape_article_text(url)
     if article_text is None:
         article_text = f"Headline: {title} (Note: Body text could not be scraped)."
@@ -406,19 +494,39 @@ def process_entry(
     with _db_lock:
         if already_processed(supabase, url_hash):
             return "skipped"
-        insert_processed_source(supabase, url_hash=url_hash, url=url, title=title, source_type=source_type)
-        insert_risk_event(
+        insert_processed_source(
             supabase,
             url_hash=url_hash,
             url=url,
-            company_name=company_name,
-            ticker=ticker,
-            assessment=assessment,
-            raw_snippet=article_text,
-            published_at=published_at,
+            title=title,
+            source_type=source_type,
         )
+        # Only persist real company-focused downside into risk_events.
+        if assessment.relevance == "primary" and assessment.is_negative_event:
+            insert_risk_event(
+                supabase,
+                url_hash=url_hash,
+                url=url,
+                company_name=company_name,
+                ticker=ticker,
+                assessment=assessment,
+                raw_snippet=article_text,
+                published_at=published_at,
+            )
+        else:
+            logger.info(
+                "Not storing risk_event for %s (%s): relevance=%s negative=%s",
+                ticker,
+                title[:60],
+                assessment.relevance,
+                assessment.is_negative_event,
+            )
 
-    if assessment.is_negative_event and assessment.severity_score >= ALERT_THRESHOLD:
+    if (
+        assessment.relevance == "primary"
+        and assessment.is_negative_event
+        and assessment.severity_score >= ALERT_THRESHOLD
+    ):
         print_risk_card(company_name, ticker, title, url, source_type, assessment)
     return "processed"
 
